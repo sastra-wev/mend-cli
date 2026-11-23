@@ -359,6 +359,9 @@ interface Section {
   creates: boolean;
   deletes: boolean;
   hunks: Hunk[];
+  /** Whether the section's hunks region has begun. A deletion's hunks are skipped, not
+   *  stored, but the header still ends where its first hunk starts. */
+  hunksSeen: boolean;
 }
 
 function newSection(): Section {
@@ -373,6 +376,7 @@ function newSection(): Section {
     creates: false,
     deletes: false,
     hunks: [],
+    hunksSeen: false,
   };
 }
 
@@ -409,6 +413,28 @@ function readUnified(lines: string[], strict: boolean): Edit[] {
 
     if (line.startsWith('@@')) {
       if (sec === null) throw new Abort(`error: parse ${i + 1}`);
+      // A deletion's hunks are not read (section 6): when the header already marks this
+      // section a deletion and not a creation, the hunk header is not validated and the
+      // body lines that follow it are passed over, up to the next hunk or section.
+      const isDeletion =
+        (sec.deletes || (sec.hasPair && sec.pairNew === '/dev/null')) &&
+        !(sec.creates || (sec.hasPair && sec.pairOld === '/dev/null'));
+      if (isDeletion) {
+        sec.hunksSeen = true;
+        i += 1;
+        while (i < lines.length) {
+          const b = lines[i]!;
+          if (b.startsWith('diff --git ')) break;
+          if (b.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) break;
+          const c = b.charAt(0);
+          if (b === '' || c === ' ' || c === '-' || c === '+' || c === '\\') {
+            i += 1;
+            continue;
+          }
+          break;
+        }
+        continue;
+      }
       const m = HUNK_RE.exec(line);
       if (m === null) throw new Abort(`error: parse ${i + 1}`);
       const body: SegLine[] = [];
@@ -443,6 +469,7 @@ function readUnified(lines: string[], strict: boolean): Edit[] {
         fromEmpty.pop();
       }
       sec.hunks.push({ a: Number(m[1]), body, noEol });
+      sec.hunksSeen = true;
       continue;
     }
 
@@ -460,7 +487,7 @@ function readUnified(lines: string[], strict: boolean): Edit[] {
         } else i += 1;
         continue;
       }
-      if (sec.hunks.length === 0) {
+      if (!sec.hunksSeen) {
         // Inside this section's header the pair must be whole, or the next line is the error.
         if (!followed) throw new Abort(`error: parse ${i + 2}`);
         if (sec.hasPair) {
@@ -486,7 +513,7 @@ function readUnified(lines: string[], strict: boolean): Edit[] {
       continue;
     }
 
-    if (sec !== null && sec.hunks.length === 0) {
+    if (sec !== null && !sec.hunksSeen) {
       if (line.startsWith('rename from ')) sec.renameFrom = line.slice('rename from '.length).trim();
       else if (line.startsWith('rename to ')) sec.renameTo = line.slice('rename to '.length).trim();
       else if (line.startsWith('new file mode')) sec.creates = true;
